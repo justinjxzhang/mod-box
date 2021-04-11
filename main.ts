@@ -1,9 +1,9 @@
-import GPIO from 'rpi-gpio';
 import WebSocket from 'ws';
 import axios from 'axios';
 import { Port, ModEffectDefinition } from './models/mod';
 import { Rotary, RotaryDirection } from './controllers/rotary';
 import { Debouncer } from './controllers/debouncer';
+import rpio from 'rpio';
 
 
 class ModEffectState {
@@ -20,17 +20,46 @@ export class ControlBox {
     private effectList: ModEffectState[] = [];
     private effectDefCache: { [uri: string]: ModEffectDefinition } = {};
 
+    private mcpPins = {
+        interrupt: {
+            a: 29,
+            b: 31
+        },
+    }
 
-    private rotaryPins = [{ clk: 22, dt: 23}];
+
+    // private rotaryPins = [{ clk: 22, dt: 23}];
+
+    private rotaryPins = [{
+        clk: { bank: 'b', pin: 2 }, 
+        dt:  { bank: 'b', pin: 1 }
+    }, {
+        clk: { bank: 'a', pin: 2 },
+        dt:  { bank: 'a', pin: 1 }
+    }, {
+        clk: { bank: 'a', pin: 5 },
+        dt:  { bank: 'a', pin: 4 }
+    }];
+
+
     private rotarys: Rotary[] = [];
 
-    private nextPin = 24;
+    private nextPin = 29;
     private nextDebouncer: Debouncer;
+    private previousDebouncer: Debouncer;
 
     constructor(
         private websocketAddress: string,
         private restAddress: string
     ) {
+        rpio.init({
+            mapping: 'physical',
+            gpiomem: false
+        });
+        rpio.i2cBegin();
+        rpio.i2cSetSlaveAddress(0x20);
+        rpio.i2cSetBaudRate(100000);
+
         this.ws = new WebSocket(websocketAddress);
         this.ws.on('message', data => {
             const [command, ...params] = (data as string).split(' ');
@@ -51,56 +80,68 @@ export class ControlBox {
                 this.effectList.find(effect => effect.id === id).parameters[symbol] = parseFloat(value);
             }
         });
-
         
-        GPIO.setMode(GPIO.MODE_BCM);
+        this.nextDebouncer = new Debouncer();
+        this.previousDebouncer = new Debouncer();
+        this.nextDebouncer.on('change', (newState: boolean) => {
+            if (newState === true) {
+                this.incrementCurrentEffectIndex(1);
+            }
+        });
+        this.previousDebouncer.on('change', (newState: boolean) => {
+            if (newState === true) {
+                this.incrementCurrentEffectIndex(-1);
+            }
+        });
 
         this.rotaryPins.forEach((rp, idx) => {
             const r = new Rotary();
-            r.on(RotaryDirection.DIR_CW, () => { this.rotaryChanged(idx, RotaryDirection.DIR_CW); });
-            r.on(RotaryDirection.DIR_CCW, () => { this.rotaryChanged(idx, RotaryDirection.DIR_CCW); });
+            r.on(RotaryDirection.DIR_CW, () => this.rotaryChanged(idx, RotaryDirection.DIR_CW));
+            r.on(RotaryDirection.DIR_CCW, () => this.rotaryChanged(idx, RotaryDirection.DIR_CCW));
             this.rotarys.push(r);
-            
-            GPIO.setup(rp.clk, GPIO.DIR_IN, GPIO.EDGE_BOTH, (setupErr) => {
-                if (setupErr) throw setupErr;
-            });
-            GPIO.setup(rp.dt, GPIO.DIR_IN, GPIO.EDGE_BOTH, (setupErr) => {
-                if (setupErr) throw setupErr;
-            });
-        });
+        })
+
+        rpio.open(this.mcpPins.interrupt.a, rpio.INPUT, rpio.PULL_DOWN);
+        rpio.open(this.mcpPins.interrupt.b, rpio.INPUT, rpio.PULL_DOWN);
+
+        rpio.i2cWrite(Buffer.from([0x00, 0b11111111])); // IODIRA
+        rpio.i2cWrite(Buffer.from([0x02, 0b11111111])); // IOPOLA
+        rpio.i2cWrite(Buffer.from([0x04, 0b11111111])); // GPINTENA
+        rpio.i2cWrite(Buffer.from([0x0C, 0b11111111])); /// GPUPPA
+
         
-        this.nextDebouncer = new Debouncer();
-        this.nextDebouncer.on('change', (newState: boolean) => {
-            if (newState === true) {
-                this.currentEffectIndex = (this.currentEffectIndex + 1) % this.effectList.length;
-                console.log(this.currentEffectDef.label);
-            }
-        });
+        rpio.i2cWrite(Buffer.from([0x01, 0b11111111])); // IODIRB
+        rpio.i2cWrite(Buffer.from([0x03, 0b11111111])); // IOPOLA
+        rpio.i2cWrite(Buffer.from([0x05, 0b11111111])); // GPINTENB
+        rpio.i2cWrite(Buffer.from([0x0D, 0b11111111])); /// GPUPPB
 
-        GPIO.setup(this.nextPin, GPIO.DIR_IN, GPIO.EDGE_BOTH, (setupErr) => {
-            if (setupErr) throw setupErr;
-        });
+        this.readMcp(31);
+        
+        [29, 31].forEach(pin => rpio.poll(pin, this.readMcp.bind(this)));
+    }
 
+    readMcp(pin: number) {
+        // BANK A
+        rpio.i2cWrite(Buffer.from([0x12]));
+        let aBuffer = Buffer.alloc(1);
+        rpio.i2cRead(aBuffer);
 
-        GPIO.on('change', (channel: number, value: boolean) => {
-            const rotaryIndex = this.rotaryPins.map(rp => [rp.clk, rp.dt]).findIndex(rp => rp.includes(channel));
-            if (rotaryIndex >= 0) {
-                const readClkPromise = new Promise<boolean>((resolve, reject) => {
-                    GPIO.read(this.rotaryPins[rotaryIndex].clk, (err, value) => err != null ? reject(err.message) : resolve(value));
-                });
-                const readDtPromise = new Promise<boolean>((resolve, reject) => {
-                    GPIO.read(this.rotaryPins[rotaryIndex].dt, (err, value) => err != null ? reject(err.message) : resolve(value));
-                });
+        // BANK B
+        rpio.i2cWrite(Buffer.from([0x13]));
+        let bBuffer = Buffer.alloc(1);
+        rpio.i2cRead(bBuffer)
+        // console.log(pin, aBuffer[0].toString(2), bBuffer[0].toString(2), aBuffer[0] >> 7 & 1);
 
-                Promise.all([readClkPromise, readDtPromise]).then(readResults => {
-                    const [clk, dt] = readResults;
-                    this.rotarys[rotaryIndex].check(clk, dt);
-                })
-            }
-            if (channel == this.nextPin) {
-                this.nextDebouncer.check(value);
-            }
-        });
+        this.nextDebouncer.check((aBuffer[0] >> 7 & 1) === 1);
+        this.previousDebouncer.check((aBuffer[0] >> 6 & 1) === 1);
+
+        this.rotaryPins.forEach((rp, idx) => {
+            const clkValue = ((rp.clk.bank === 'a' ? aBuffer[0] : bBuffer[0]) >> rp.clk.pin & 1) === 1;
+            const dtValue = ((rp.dt.bank === 'a' ? aBuffer[0] : bBuffer[0]) >> rp.dt.pin & 1) === 1;
+
+            this.rotarys[idx].check(clkValue, dtValue);
+        })
+
     }
 
     get currentEffect(): ModEffectState {
@@ -109,6 +150,11 @@ export class ControlBox {
 
     get currentEffectDef(): ModEffectDefinition {
         return this.effectDefCache[this.effectList.find(effect => effect.id === this.currentEffect.id).uri];
+    }
+
+    incrementCurrentEffectIndex(increment: number) {
+        this.currentEffectIndex = (this.currentEffectIndex + increment) % this.effectList.length;
+        console.log(this.currentEffectDef.label);
     }
 
     rotaryChanged(index: number, direction: RotaryDirection) {

@@ -37,16 +37,22 @@ export class Rotary extends EventEmitter {
 
     private state = Rotary.R_START;
 
-    check(val1: boolean, val2: boolean) {
-        const inputState = ((val2 ? 1 : 0) << 1) | (val1 ? 1 : 0);
-        this.state = Rotary.grayTable[this.state & 0xf][inputState];
+    private lastClk = false;
+    private lastDt = false;
 
-        if ((this.state & 0x30) === Rotary.DIR_CW) {
-            this.emit(RotaryDirection.DIR_CW);
+    check(clk: boolean, dt: boolean) {
+        if (this.lastClk != clk || this.lastDt != dt) {
+            this.lastClk = clk;
+            this.lastDt = dt;
+            const inputState = ((clk ? 1 : 0) << 1) | (dt ? 1 : 0);
+            this.state = Rotary.grayTable[this.state & 0xf][inputState];
+
+            if ((this.state & 0x30) === Rotary.DIR_CW) {
+                this.emit(RotaryDirection.DIR_CW);
+            }
+            else if ((this.state & 0x30) === Rotary.DIR_CCW) {
+                this.emit(RotaryDirection.DIR_CCW);
+            }
         }
-        else if ((this.state & 0x30) === Rotary.DIR_CCW) {
-            this.emit(RotaryDirection.DIR_CCW);
-        }
-        console.log((this.state & 0x30).toString(2));
     }
 }

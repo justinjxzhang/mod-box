@@ -41,7 +41,7 @@ export class Rotary extends EventEmitter {
     private lastDt = false;
 
     check(clk: boolean, dt: boolean) {
-        if (this.lastClk != clk || this.lastDt != dt) {
+        // if (this.lastClk != clk || this.lastDt != dt) {
             this.lastClk = clk;
             this.lastDt = dt;
             const inputState = ((clk ? 1 : 0) << 1) | (dt ? 1 : 0);
@@ -53,6 +53,6 @@ export class Rotary extends EventEmitter {
             else if ((this.state & 0x30) === Rotary.DIR_CCW) {
                 this.emit(RotaryDirection.DIR_CCW);
             }
-        }
+        // }
     }
 }

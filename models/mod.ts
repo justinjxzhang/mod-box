@@ -13,6 +13,11 @@ export interface Port {
         render?: string;
         symbol?: string;
     }
+    scalePoints?: {
+        valid?: boolean;
+        value?: number,
+        label?: string;
+    }[],
     properties: string[];
 }
 

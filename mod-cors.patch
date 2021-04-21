@@ -1,0 +1,25 @@
+diff --git a/mod/webserver.py b/mod/webserver.py
+index 20b0fe93..1a1da0f8 100644
+--- a/mod/webserver.py
++++ b/mod/webserver.py
+@@ -813,6 +813,9 @@ class SDKEffectUpdater(JsonRequestHandler):
+         self.write({ 'ok': True })
+ 
+ class EffectResource(TimelessStaticFileHandler):
++    def options(self):
++        self.set_status(204)
++        self.finish()
+ 
+     def initialize(self):
+         # Overrides StaticFileHandler initialize
+@@ -1129,6 +1132,10 @@ class EffectPresetDelete(JsonRequestHandler):
+         self.write(ok)
+ 
+ class ServerWebSocket(websocket.WebSocketHandler):
++    def check_origin(self, origin):
++        print(origin)
++        return True
++
+     @gen.coroutine
+     def open(self):
+         print("websocket open")

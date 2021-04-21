@@ -6,7 +6,8 @@ import { Debouncer } from './controllers/debouncer';
 import rpio from 'rpio';
 import low from 'lowdb';
 import FileSync from 'lowdb/adapters/FileSync';
-
+import Oled from '../oled-js/oled';
+import * as oledfont5x7 from 'oled-font-5x7';
 
 class ModEffectState {
     id: string;
@@ -26,7 +27,56 @@ interface RotaryPinConfig<TPinConfiguration> {
     sw: TPinConfiguration;
 }
 
+interface I2CInterface {
+    write: (address: number, buffer: number[]) => void;
+    read: (address: number, length: number) => number[];
+}
+
+class RpioI2cInterface implements I2CInterface {
+    private rpioInstance: Rpio;
+
+    constructor(rpioInstance: Rpio) {
+        this.rpioInstance = rpioInstance;
+    }
+
+    write(address: number, buffer: number[]) {
+        this.rpioInstance.i2cSetSlaveAddress(address);
+        this.rpioInstance.i2cWrite(Buffer.from(buffer));
+    }
+
+    read(address: number, length: number): number[] {
+        this.rpioInstance.i2cSetSlaveAddress(address);
+        const readBuf = Buffer.alloc(length);
+        this.rpioInstance.i2cRead(readBuf);
+        return [...readBuf];
+    }
+}
+
+class TCA9548A {
+    private currentRegister: number;
+
+    constructor(
+        private address: number,
+        private iicInterface: I2CInterface
+    ) { }
+
+    selectRegister(register: number) {
+        if (this.currentRegister != register) {
+            this.iicInterface.write(this.address, [(1 << register)]);
+            this.currentRegister = register;
+        }
+    }
+}
+
 export class ControlBox {
+
+    // private startupDataLoaded: NodeJS.Timeout;
+    private startup: {
+        completed: boolean,
+        timeout?: NodeJS.Timeout
+    } = {
+        completed: false
+    };
 
     private modWebsocket: WebSocket;
     private modBoxWebsocket: WebSocketServer;
@@ -112,11 +162,27 @@ export class ControlBox {
 
     private db: low.LowdbSync<any>;
 
+    private iicInterface: I2CInterface;
+    private tca9584a: TCA9548A;
+
+    private controlOleds: { 
+        tcaPort: number,
+        oled: Oled
+    }[] = [];
+
+    private mainOled: {
+        tcaPort: number;
+        oled: Oled
+    };
+
+    private controlUpdateTimeout: NodeJS.Timeout;
+
     constructor(
         private websocketAddress: string,
         private restAddress: string
     ) {
         this.db = low(new FileSync('config.json'));
+
         if (this.db.has('["currentEffectId"]').value()) {
             this.currentEffectId = this.db.get('["currentEffectId"]').value();
         }
@@ -152,14 +218,53 @@ export class ControlBox {
                 axios.get(`${restAddress}/effect/get?uri=${encodeURIComponent(uri)}`).then(r => {
                     this.effectDefCache[uri] = r.data as ModEffectDefinition;
 
-                    if (this.effectList[0].id === graph) {
-                        this.loadEffectParamMap();
-                    }
+                    // if (this.effectList[0].id === graph) {
+                    //     this.loadEffectParamMap();
+                    // }
+                }, rej => {
+                    console.log(rej);
                 });
             }
             else if (command === 'param_set') {
                 const [id, symbol, value] = params;
                 this.effectList.find(effect => effect.id === id).parameters[symbol] = parseFloat(value);
+                if (this.currentEffect?.id === id) {
+                    const paramIdx = this.currentEffectParamMap?.findIndex(param => param === symbol);
+                    if (paramIdx >= 0 && paramIdx >= this.rotaryControls.length * this.rotaryBank && paramIdx < this.rotaryControls.length * this.rotaryBank + this.rotaryControls.length) {
+                        const bankedOledIdx = this.mod(paramIdx, this.rotaryControls.length);
+                        if (this.controlOleds.length > bankedOledIdx)
+                        {
+                            this.drawCurrentValue(
+                                this.controlOleds[bankedOledIdx].oled,
+                                this.currentEffect.parameters[symbol],
+                                this.currentEffectDef.ports.control.input.find(c => c.symbol === symbol)
+                            );
+                            this.controlOleds[bankedOledIdx].oled.update();
+                        }
+                    }
+                }
+            }
+
+            if (!this.startup.completed && !['stats', 'ping', 'sys_stats'].includes(command)) {
+                if (this.startup.timeout != null) {
+                    clearTimeout(this.startup.timeout);
+                }
+                this.startup.timeout = setTimeout(() => {
+                    if (!this.effectList.map(e => e.id).includes(this.currentEffectId)) {
+                        this.currentEffectId = this.effectList[0].id;
+                    }
+                    this.loadEffectParamMap();
+                    this.controlOleds.forEach((oledConfig, oledIndex) => {
+                        oledConfig.oled.setCursor(0, 0);
+                        const currentPort = this.currentEffectDef.ports.control.input.find(p => p.symbol === this.currentEffectParamMap[oledIndex]);
+                        if (currentPort != null) {
+                            oledConfig.oled.writeString(oledfont5x7, 1, currentPort.name ?? "", 0x01, false, 1, false);
+                            this.drawCurrentValueByIndex(oledIndex);
+                            oledConfig.oled.update();
+                        }
+                    });
+                    this.startup.completed = true;
+                }, 1000);
             }
         });
 
@@ -177,12 +282,48 @@ export class ControlBox {
                 if (this.rotaryControllers[idx].mode === 'edit') {
                     this.rotaryControllers[idx].mode = 'control';
                     this.db.set(`["rotary_param_map"]["${this.currentEffect.uri}"][${idx}]`, this.currentEffectParamMap[this.rotaryBank * this.rotaryControllers.length + idx]).write();
+                    
+                    const currentPort = this.currentEffectDef.ports.control.input.find(p => p.symbol === this.currentEffectParamMap[idx]);
+                    const currentValue = this.currentEffect.parameters[this.currentEffectParamMap[idx]];
+
+
+                    if (idx < this.controlOleds.length) {
+                    
+                        this.controlOleds[idx].oled.clearDisplay();
+                        this.controlOleds[idx].oled.setCursor(0, 0);
+                        if (currentPort != null) {
+                            this.controlOleds[idx].oled.writeString(oledfont5x7, 1, currentPort.name ?? "", 0x01, false, 1, false);
+                            this.drawCurrentValueByIndex(idx);
+                        }
+    
+                        this.controlOleds[idx].oled.update();
+                    }
+                    
+
                     console.log(`Rotary ${idx} mode: ${this.rotaryControllers[idx].mode}, param: ${this.currentEffectParamMap[this.rotaryBank * this.rotaryControllers.length + idx]}`);
                 }
             });
             d.on(Debouncer.HELD, () => {
                 if (this.rotaryControllers[idx].mode === 'control') {
                     this.rotaryControllers[idx].mode = 'edit';
+                    
+                    // const currOled = this.controlOleds[idx].oled;
+                    // currOled.clearDisplay();
+                    // currOled.setCursor(0, 0);
+                    // currOled.writeString(oledfont5x7, 1, this.currentEffectDef.label, 0x01, false, 1, false);
+                    // currOled.drawLine(0, 9, 127, 9, 0x01, false);
+
+                    // this.currentEffectDef.ports.control.input.forEach((inputControl, portIdx) => {
+                    //     currOled.setCursor(0, (10 * portIdx) + 11);
+                    //     currOled.writeString(oledfont5x7, 1, `${this.currentEffectParamMap[idx] === inputControl.symbol ? "* " :  "  "}${inputControl.name}`, 0x01, false, 1, false);
+                    //     currOled.update();
+                    // });
+
+                    if (idx < this.controlOleds.length) {
+                        this.drawPortSelectMenu(idx);
+                        this.controlOleds[idx].oled.update();
+                    }
+
                     console.log(`Rotary ${idx} mode: ${this.rotaryControllers[idx].mode}`);
                 }
             });
@@ -200,7 +341,10 @@ export class ControlBox {
         });
 
         rpio.i2cBegin();
-        rpio.i2cSetBaudRate(100000);
+        rpio.i2cSetBaudRate(400000);
+
+        this.iicInterface = new RpioI2cInterface(rpio);
+        this.tca9584a = new TCA9548A(0x70, this.iicInterface);
 
         this.mcpConfig.forEach(config => {
 
@@ -220,11 +364,67 @@ export class ControlBox {
     
             rpio.i2cWrite(Buffer.from([0x0A, 0 | (1 << 6)])); // IOCON INTERRUPT MIRROR
         })
-        
-        this.readMcp(29);
-        this.readMcp(31);
-        
-        [29, 31].forEach(pin => rpio.poll(pin, this.readMcp.bind(this)));
+
+        this.mcpConfig.forEach(conf => {
+            this.readMcp(conf.interruptPin);
+            rpio.poll(conf.interruptPin, this.readMcp.bind(this))
+        });
+
+        this.controlOleds = [2, 3, 4, 5].map(port => {
+
+            const currOled = new Oled(
+                (address, dataArray) => {
+                    this.tca9584a.selectRegister(port);
+                    rpio.i2cSetSlaveAddress(address);
+                    rpio.i2cWrite(Buffer.from(dataArray));
+                },
+                (address) => {
+                    rpio.i2cSetSlaveAddress(address);
+                    const readBuf = Buffer.alloc(1);
+                    rpio.i2cRead(readBuf);
+                    return readBuf[0];
+                },
+                {
+                    address: 0x3c,
+                    height: 64,
+                    width:128
+                }
+            );
+
+            currOled.turnOnDisplay();
+            currOled.fillRect(0, 0, 128, 64, 0x00, true);
+
+            return {
+                tcaPort: port,
+                oled: currOled
+            };
+        });
+
+        this.mainOled = {
+            oled: new Oled(
+                (address, dataArray) => {
+                    this.tca9584a.selectRegister(7);
+                    rpio.i2cSetSlaveAddress(address);
+                    rpio.i2cWrite(Buffer.from(dataArray));
+                },
+                (address) => {
+                    this.tca9584a.selectRegister(7);
+                    rpio.i2cSetSlaveAddress(address);
+                    const readBuf = Buffer.alloc(1);
+                    rpio.i2cRead(readBuf);
+                    return readBuf[0];
+                },
+                {
+                    address: 0x3c,
+                    height: 64,
+                    width:128
+                }
+            ),
+            tcaPort: 7
+        };
+
+        this.mainOled.oled.turnOnDisplay();
+        this.mainOled.oled.fillRect(0, 0, 128, 64, 0x00, true);
     }
 
     readMcp(pin: number) {
@@ -286,10 +486,116 @@ export class ControlBox {
             effectBank: this.rotaryBank,
             controlCount: this.rotaryControllers.length
         });
+
+        this.mainOled.oled.clearDisplay(false);
+        this.mainOled.oled.setCursor(0, 0);
+
+        this.drawList(this.mainOled.oled, 0, 0, 6, this.effectList, this.currentEffectId, e => this.effectDefCache[e.uri].label, (a, b) => a.id === b);
+        this.mainOled.oled.update();
+
+        if (this.controlUpdateTimeout != null) clearTimeout(this.controlUpdateTimeout);
+        this.controlUpdateTimeout = setTimeout(() => {
+            this.controlOleds.forEach((oledConfig, idx) => {
+                if (idx < this.currentEffectParamMap.length) {
+                    const currentPort = this.currentEffectDef.ports.control.input.find(p => p.symbol === this.currentEffectParamMap[idx]);
+                    oledConfig.oled.clearDisplay(false);
+                    if (currentPort != null) {
+                        oledConfig.oled.setCursor(0, 0);
+                        oledConfig.oled.writeString(oledfont5x7, 1, currentPort.name, 0x01, true, 1, false);
+                        this.drawCurrentValueByIndex(idx);
+                    }
+                }
+                else {
+                    oledConfig.oled.clearDisplay();
+                }
+                oledConfig.oled.update();
+            });
+        }, 750);
+
         console.log(this.currentEffectDef.label, this.currentEffectParamMap);
     }
 
+    calculatePortProportion(currentValue: number, portDef: Port): number {
+        const { minimum, maximum } = portDef.ranges;
+        if (portDef.properties.includes('logarithmic')) {
+            const minLog = Math.log2(minimum);
+            const maxLog = Math.log2(maximum);
+            const currentLog = Math.log2(currentValue);
+            return (currentLog - minLog) / (maxLog - minLog);
+        }
+        else {
+            return (currentValue - minimum) / (maximum - minimum)
+        }
+    }
+
+    drawCurrentValue(oled: Oled, currentValue: number, portDef: Port) {
+        if (portDef.properties.includes('enumeration')) {
+            this.drawList(oled, 0, 30, 3, portDef.scalePoints, currentValue, sp => sp.label, (a, b) => a.value === b);
+        } else {
+            oled.fillRect(1, 51, 125, 12, 0x00, false);
+            oled.drawRect(0, 50, 127, 14, 0x01, false);
+            oled.fillRect(2, 52, (127 * this.calculatePortProportion(currentValue, portDef)), 10, 0x01, false);
+
+            // Draw ticks
+            oled.drawLine(0, 45, 0, 50, 0x01, false);
+            oled.drawLine(127, 45, 127, 50, 0x01, false);
+            oled.drawLine(64, 45, 64, 50, 0x01, false);
+        }
+    }
+
+    drawCurrentValueByIndex(controlIndex: number) {
+        const bankIndex = (this.rotaryBank * this.rotaryControls.length) + controlIndex;
+        const symbol = this.currentEffectParamMap[bankIndex];
+
+        const currentValue = this.currentEffect.parameters[symbol];
+        const portDef = this.currentEffectDef.ports.control.input.find(c => c.symbol === symbol);
+
+        if (controlIndex < this.controlOleds.length) {
+            this.drawCurrentValue(
+                this.controlOleds[controlIndex].oled,
+                currentValue,
+                portDef
+            );
+        }
+    }
+
+    drawList<T1, T2>(oled: Oled, x: number, y: number, itemsPerPage: number, items: T1[], selected: T2, nameGetter: (v: T1) => string, compare: (a: T1, b: T2) => boolean) {
+        const selectedIndex = items.findIndex(i => compare(i, selected));
+        const selectedIndexPage = this.mod(selectedIndex, itemsPerPage);
+        const currentPage = Math.floor(selectedIndex / itemsPerPage);
+        const pageItems = items.filter((item, index) => index >= itemsPerPage * currentPage && index < itemsPerPage * currentPage + itemsPerPage);
+
+        oled.fillRect(x, y, 128, itemsPerPage * 10, 0x00, false);
+
+        oled.setCursor(x, y);
+        pageItems.forEach((pageItem, idx) => {
+            const displayString = `${idx === selectedIndexPage ? '* ' : '  '}${nameGetter(pageItem)}`;
+            oled.setCursor(x, (idx * 10) + y);
+            oled.writeString(oledfont5x7, 1, displayString, 0x01, false, 1, false);
+        });
+    }
+
+    drawPortSelectMenu(controlIdx: number) {
+        const currOled = this.controlOleds[controlIdx].oled;
+        currOled.clearDisplay();
+        currOled.setCursor(0, 0);
+        currOled.writeString(oledfont5x7, 1, this.currentEffectDef.label, 0x01, false, 1, false);
+        currOled.drawLine(0, 9, 127, 9, 0x01, false);
+        
+        this.drawList(
+            currOled, 
+            0, 
+            11, 
+            4, 
+            [null, ...this.currentEffectDef.ports.control.input], 
+            this.currentEffectParamMap[controlIdx],
+            (v) => v?.name ?? '-- Clear --',
+            (a, b) => a?.symbol == b
+        );
+    }
+
     loadEffectParamMap() {
+        console.log(this._currentEffectId, this.effectList.map(e => e.id));
         const uriEscaped = `["rotary_param_map"]["${this.currentEffect.uri}"]`;
         
         if (!this.db.has(uriEscaped).value()) {
@@ -328,16 +634,25 @@ export class ControlBox {
                 if (this.currentEffect.parameters[controlPort.symbol] <= controlPort.ranges?.minimum) { this.currentEffect.parameters[controlPort.symbol] = controlPort.ranges?.minimum; }
                 if (this.currentEffect.parameters[controlPort.symbol] >= controlPort.ranges?.maximum) { this.currentEffect.parameters[controlPort.symbol] = controlPort.ranges?.maximum; }
 
+                if(this.controlOleds.length > rotaryIndex) {
+                    this.drawCurrentValueByIndex(rotaryIndex);
+                    this.controlOleds[rotaryIndex].oled.update();
+                }
+
                 console.log(`param_set ${this.currentEffect.id}/${controlPort.symbol} ${this.currentEffect.parameters[controlPort.symbol]}`);
         
                 this.modWebsocket.send(`param_set ${this.currentEffect.id}/${controlPort.symbol} ${this.currentEffect.parameters[controlPort.symbol]}`);
             }
         }
         else {
-            const orderedControls = this.currentEffectDef.ports?.control?.input?.sort((a, b) => a.index - b.index);
-            const currentControlIdx = orderedControls.findIndex(control => control.symbol === this.currentEffectParamMap[rotaryIndex]);
-            this.currentEffectParamMap[rotaryIndex] = orderedControls[this.mod(currentControlIdx + this.rotDirToNum(direction), orderedControls.length)].symbol;
-            console.log(`Rotary ${this.rotaryBank * this.rotaryControllers.length + rotaryIndex} (bank ${this.rotaryBank}, phy ${rotaryIndex}): ${this.currentEffectParamMap[rotaryIndex]}`);
+            const orderedControls = [null, ...this.currentEffectDef.ports?.control?.input?.sort((a, b) => a.index - b.index)];
+            const currentControlIdx = orderedControls.findIndex(control => control?.symbol == this.currentEffectParamMap[rotaryIndex]);
+            this.currentEffectParamMap[rotaryIndex] = orderedControls[this.mod(currentControlIdx + this.rotDirToNum(direction), orderedControls.length)]?.symbol;
+            if (this.controlOleds.length > rotaryIndex) {
+                this.drawPortSelectMenu(rotaryIndex);
+                this.controlOleds[rotaryIndex].oled.update();
+            }
+            console.log(`Rotary ${this.rotaryBank * this.rotaryControllers.length + rotaryIndex} (bank ${this.rotaryBank}, phy ${rotaryIndex}): ${this.currentEffectParamMap[rotaryIndex] ?? 'nothing'}`);
 
         }
     }

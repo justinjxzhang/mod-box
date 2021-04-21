@@ -7,5 +7,9 @@ Built for the Raspberry Pi in node, this connects to the MOD suite via the webso
 
 This also relies on the [modified oled-js library](https://github.com/justinjxzhang/oled-js)
 
-To run, simply install the dependencies using `npm install`, pull the aforementioned oled-js library into the same parent folder as this project and then run with 'sudo npx ts-node-dev main.ts'
-*Running as root required in order to access the Raspberry Pi's I2C*
+Slight modificiations to mod-ui are needed in order to allow for CORS with the websocket handler and the EffectResource REST endpoint, patch is in mod-cors.patch
+
+To run:
+* install dependencies using `npm install`
+* pull the aforementioned oled-js library into the same parent folder as this project
+* run with 'sudo npx ts-node-dev main.ts' *Running as root required in order to access the Raspberry Pi's I2C*

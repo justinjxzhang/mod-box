@@ -58,3 +58,9 @@ export class Rotary extends EventEmitter {
         }
     }
 }
+
+export interface RotaryPinConfig<TPinConfiguration> {
+    clk: TPinConfiguration;
+    dt: TPinConfiguration;
+    sw: TPinConfiguration;
+}
